@@ -7,9 +7,10 @@ from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from langdetect import detect
 from deep_translator import GoogleTranslator
-import psycopg2
-from psycopg.rows import dict_row
-import psycopg2.extras
+
+import psycopg                      # <-- guna psycopg v3
+from psycopg.rows import dict_row   # <-- untuk dapat row dalam bentuk dict
+
 
 # =========================
 # Config
@@ -110,7 +111,6 @@ def _connect():
     conn = psycopg.connect(dsn, row_factory=dict_row)
     return conn
 
-
 def _to_bytes(blob):
     if blob is None:
         return None
@@ -139,7 +139,7 @@ def _expand_query(q: str) -> str:
 
 def _load_qa_rows(category: str):
     conn = _connect()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c = conn.cursor()
     try:
         c.execute("""
             SELECT id, question, answer, q_embedding
@@ -250,7 +250,7 @@ def retrieve_candidates_any(question: str, top_n: int = TOP_N):
 
 def related_kb_questions(question: str, category: str, exclude_q: str = None, n: int = 3):
     conn = _connect()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c = conn.cursor()
     try:
         c.execute("""
             SELECT id, question, q_embedding
@@ -284,7 +284,7 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
 # =========================
 def _gather_fact_context(category: str, keywords, limit_pairs: int = 6, max_chars: int = 1800) -> str:
     conn = _connect()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c = conn.cursor()
     if not keywords:
         return ""
     kw_like = " OR ".join(["question ILIKE %s OR answer ILIKE %s"] * len(keywords))
@@ -365,7 +365,7 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
 # =========================
 def _qa_pairs_for_category(category: str):
     conn = _connect()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c = conn.cursor()
     try:
         c.execute(
             "SELECT question, answer FROM knowledge_base_qa WHERE category = %s ORDER BY id ASC",
@@ -661,7 +661,7 @@ def admin_list_qa():
         offset = (page - 1) * limit
 
         conn = _connect()
-        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c = conn.cursor()
 
         base_sql = "FROM knowledge_base_qa WHERE 1=1"
         params = []
@@ -703,7 +703,7 @@ def admin_create_qa():
 
         emb = _embed(question).tobytes()
         conn = _connect()
-        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c = conn.cursor()
         c.execute(
             "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (%s, %s, %s, %s) RETURNING id",
             (category, question, answer, emb)
@@ -727,7 +727,7 @@ def admin_update_qa(item_id):
         answer   = data.get("answer")
 
         conn = _connect()
-        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c = conn.cursor()
 
         c.execute("SELECT category, question, answer FROM knowledge_base_qa WHERE id = %s", (item_id,))
         row = c.fetchone()
@@ -766,7 +766,7 @@ def admin_update_qa(item_id):
 def admin_delete_qa(item_id):
     try:
         conn = _connect()
-        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c = conn.cursor()
         c.execute("SELECT category FROM knowledge_base_qa WHERE id = %s", (item_id,))
         r = c.fetchone()
         if not r:
@@ -787,4 +787,5 @@ def admin_delete_qa(item_id):
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
+
 
