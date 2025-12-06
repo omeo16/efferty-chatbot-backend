@@ -1,6 +1,5 @@
 import os
 import re
-import sqlite3
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -8,6 +7,8 @@ from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from langdetect import detect
 from deep_translator import GoogleTranslator
+import psycopg2
+import psycopg2.extras
 
 # =========================
 # Config
@@ -21,13 +22,16 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # Models
-EMBED_MODEL = "text-embedding-3-small"   
+EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL  = "gpt-4o-mini"
 
-DB_PATH = "kb.db"
+# PostgreSQL connection string from Render env
+DB_URL = os.getenv("DATABASE_URL")
+if not DB_URL:
+    raise Exception("Set DATABASE_URL in Render/Postgres env")
 
 TOP_N = 8
-SIM_THRESHOLD = 0.10   
+SIM_THRESHOLD = 0.10
 KW_THRESHOLD  = 0.08
 
 COS_MIN       = 0.20     # minimum cosine to be considered "plausible"
@@ -98,9 +102,16 @@ def linkify_platforms(text: str) -> str:
     return html
 
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    # sslmode="require" untuk Render Postgres
+    conn = psycopg2.connect(DB_URL, sslmode="require")
     return conn
+
+def _to_bytes(blob):
+    if blob is None:
+        return None
+    if isinstance(blob, memoryview):
+        return blob.tobytes()
+    return blob
 
 # --- Category normalization (handles 'Sedang Hamil  ' vs 'sedang_hamil') ---
 def _norm_cat_key(s: str) -> str:
@@ -123,16 +134,15 @@ def _expand_query(q: str) -> str:
 
 def _load_qa_rows(category: str):
     conn = _connect()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        # TRIM + normalize to avoid whitespace/label mismatches
         c.execute("""
             SELECT id, question, answer, q_embedding
             FROM knowledge_base_qa
-            WHERE lower(replace(trim(category), ' ', '_')) = ?
+            WHERE lower(replace(trim(category), ' ', '_')) = %s
         """, (_norm_cat_key(category),))
         rows = c.fetchall()
-    except sqlite3.OperationalError:
+    except Exception:
         rows = []
     finally:
         conn.close()
@@ -140,7 +150,7 @@ def _load_qa_rows(category: str):
         print(f"[DEBUG] loaded rows for {category} =", len(rows))
     items = []
     for row in rows:
-        emb_blob = row["q_embedding"]
+        emb_blob = _to_bytes(row["q_embedding"])
         if emb_blob is None:
             continue
         emb = np.frombuffer(emb_blob, dtype=np.float32)
@@ -235,15 +245,15 @@ def retrieve_candidates_any(question: str, top_n: int = TOP_N):
 
 def related_kb_questions(question: str, category: str, exclude_q: str = None, n: int = 3):
     conn = _connect()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         c.execute("""
             SELECT id, question, q_embedding
             FROM knowledge_base_qa
-            WHERE lower(replace(trim(category), ' ', '_')) = ?
+            WHERE lower(replace(trim(category), ' ', '_')) = %s
         """, (_norm_cat_key(category),))
         rows = c.fetchall()
-    except sqlite3.OperationalError:
+    except Exception:
         rows = []
     finally:
         conn.close()
@@ -255,7 +265,10 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
         q_text = row["question"]
         if exclude_q and q_text.strip().lower() == exclude_q.strip().lower():
             continue
-        emb = np.frombuffer(row["q_embedding"], dtype=np.float32)
+        emb_blob = _to_bytes(row["q_embedding"])
+        if emb_blob is None:
+            continue
+        emb = np.frombuffer(emb_blob, dtype=np.float32)
         cos = _cosine(qvec, emb)
         scored.append((cos, q_text))
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -266,10 +279,10 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
 # =========================
 def _gather_fact_context(category: str, keywords, limit_pairs: int = 6, max_chars: int = 1800) -> str:
     conn = _connect()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     if not keywords:
         return ""
-    kw_like = " OR ".join(["question LIKE ? OR answer LIKE ?"] * len(keywords))
+    kw_like = " OR ".join(["question ILIKE %s OR answer ILIKE %s"] * len(keywords))
     params = []
     for kw in keywords:
         like = f"%{kw}%"
@@ -278,8 +291,8 @@ def _gather_fact_context(category: str, keywords, limit_pairs: int = 6, max_char
         c.execute(
             f"""
             SELECT question, answer FROM knowledge_base_qa
-            WHERE lower(replace(trim(category), ' ', '_')) = ? AND ({kw_like})
-            ORDER BY id DESC LIMIT ?
+            WHERE lower(replace(trim(category), ' ', '_')) = %s AND ({kw_like})
+            ORDER BY id DESC LIMIT %s
             """,
             (_norm_cat_key(category), *params, limit_pairs)
         )
@@ -347,9 +360,12 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
 # =========================
 def _qa_pairs_for_category(category: str):
     conn = _connect()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        c.execute("""SELECT question, answer FROM knowledge_base_qa WHERE category = ? ORDER BY id ASC""", (category,))
+        c.execute(
+            "SELECT question, answer FROM knowledge_base_qa WHERE category = %s ORDER BY id ASC",
+            (category,)
+        )
         rows = c.fetchall()
     finally:
         conn.close()
@@ -360,7 +376,6 @@ def _sync_category_txt(category: str):
     if not fname:
         print(f"[SYNC] No txt mapping for category: {category}")
         return
-    import os
     os.makedirs(BASE_FOLDER, exist_ok=True)
     path = os.path.join(BASE_FOLDER, fname)
     pairs = _qa_pairs_for_category(category)
@@ -380,11 +395,11 @@ def _ensure_generated_table():
         c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS generated_answers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 category TEXT,
                 user_question TEXT,
                 ai_answer TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 approved INTEGER DEFAULT 0
             )
         """)
@@ -491,7 +506,7 @@ def ask():
                     extra = _justify_answer(question, answer, cat_key)
                     if not extra:
 
-                        any_best, any_cat = retrieve_candidates_any(question, top_n=TOP_N)
+                        any_best, any_cat = retrieve_candidates_any(question, TOP_N)
                         if any_cat:
                             kws = list(set(_tokens(question)))
                             facts = _gather_fact_context(any_cat, kws)
@@ -603,7 +618,7 @@ def ask():
             conn = _connect()
             c = conn.cursor()
             c.execute(
-                "INSERT INTO generated_answers (category, user_question, ai_answer) VALUES (?, ?, ?)",
+                "INSERT INTO generated_answers (category, user_question, ai_answer) VALUES (%s, %s, %s)",
                 (cat_key, question, answer)
             )
             conn.commit()
@@ -641,23 +656,23 @@ def admin_list_qa():
         offset = (page - 1) * limit
 
         conn = _connect()
-        c = conn.cursor()
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
         base_sql = "FROM knowledge_base_qa WHERE 1=1"
         params = []
         if category:
-            base_sql += " AND category=?"
+            base_sql += " AND category = %s"
             params.append(category)
         if query:
-            base_sql += " AND (question LIKE ? OR answer LIKE ?)"
+            base_sql += " AND (question ILIKE %s OR answer ILIKE %s)"
             like = f"%{query}%"
             params.extend([like, like])
 
-        c.execute(f"SELECT COUNT(*) {base_sql}", params)
-        total = c.fetchone()[0]
+        c.execute(f"SELECT COUNT(*) AS total_count {base_sql}", params)
+        total = c.fetchone()["total_count"]
 
         c.execute(
-            f"SELECT id, category, question, answer {base_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT id, category, question, answer {base_sql} ORDER BY id DESC LIMIT %s OFFSET %s",
             (*params, limit, offset)
         )
         rows = c.fetchall()
@@ -683,12 +698,12 @@ def admin_create_qa():
 
         emb = _embed(question).tobytes()
         conn = _connect()
-        c = conn.cursor()
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         c.execute(
-            "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (?, ?, ?, ?)",
+            "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (%s, %s, %s, %s) RETURNING id",
             (category, question, answer, emb)
         )
-        new_id = c.lastrowid
+        new_id = c.fetchone()["id"]
         conn.commit()
         conn.close()
 
@@ -707,9 +722,9 @@ def admin_update_qa(item_id):
         answer   = data.get("answer")
 
         conn = _connect()
-        c = conn.cursor()
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        c.execute("SELECT category, question, answer FROM knowledge_base_qa WHERE id=?", (item_id,))
+        c.execute("SELECT category, question, answer FROM knowledge_base_qa WHERE id = %s", (item_id,))
         row = c.fetchone()
         if not row:
             conn.close()
@@ -721,12 +736,12 @@ def admin_update_qa(item_id):
         new_a   = answer.strip() if isinstance(answer, str) else row["answer"]
 
         params = [new_cat, new_q, new_a]
-        sql = "UPDATE knowledge_base_qa SET category=?, question=?, answer=?"
+        sql = "UPDATE knowledge_base_qa SET category = %s, question = %s, answer = %s"
         if new_q != row["question"]:
             new_emb = _embed(new_q).tobytes()
-            sql += ", q_embedding=?"
+            sql += ", q_embedding = %s"
             params.append(new_emb)
-        sql += " WHERE id=?"
+        sql += " WHERE id = %s"
         params.append(item_id)
 
         c.execute(sql, params)
@@ -746,15 +761,15 @@ def admin_update_qa(item_id):
 def admin_delete_qa(item_id):
     try:
         conn = _connect()
-        c = conn.cursor()
-        c.execute("SELECT category FROM knowledge_base_qa WHERE id=?", (item_id,))
+        c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        c.execute("SELECT category FROM knowledge_base_qa WHERE id = %s", (item_id,))
         r = c.fetchone()
         if not r:
             conn.close()
             return jsonify({"error": "Not found"}), 404
         cat = r["category"]
 
-        c.execute("DELETE FROM knowledge_base_qa WHERE id=?", (item_id,))
+        c.execute("DELETE FROM knowledge_base_qa WHERE id = %s", (item_id,))
         conn.commit()
         conn.close()
 
