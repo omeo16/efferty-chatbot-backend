@@ -8,6 +8,7 @@ from openai import OpenAI
 from langdetect import detect
 from deep_translator import GoogleTranslator
 import psycopg2
+from psycopg.rows import dict_row
 import psycopg2.extras
 
 # =========================
@@ -102,9 +103,13 @@ def linkify_platforms(text: str) -> str:
     return html
 
 def _connect():
-    # sslmode="require" untuk Render Postgres
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is not set")
+    # row_factory=dict_row bagi kita dapat dict macam sqlite3.Row
+    conn = psycopg.connect(dsn, row_factory=dict_row)
     return conn
+
 
 def _to_bytes(blob):
     if blob is None:
@@ -782,3 +787,4 @@ def admin_delete_qa(item_id):
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
+
